@@ -1,0 +1,473 @@
+############## Correlation network and Leiden communities with causal analysis of modules #############
+#########################################################################################################
+
+################# Inputs
+f=list(set(coagulation+complement+platelet+neutrophil+endothelial+inflammation+mediator_s)) ### list of selected proteins
+
+treat='Plasma'
+treatment='Plasma'
+Omic_set=True
+
+################## replace Plasma with LTOWB for all relevant parameters
+if treat=='LTOWB':
+    mode='Plasma'
+else:
+    mode='LTOWB'
+confounder_q=['ISS','Head_AIS','Age','Shock','phgcs','phrr','Fluids',
+              'Cryo_units','Platelet_units','PRBC_units','LTOWB_units'] 
+confounder_bi=['Penetrating','Biological_sex']#,'Cryo','Platelet','PRBC',mode]
+
+
+moderator=confounder_q+confounder_bi
+
+powered=2
+splits=10
+sample_set='SWAT'
+
+reps=500
+split=10
+
+time1=0
+time2=24
+time3=4
+
+colormap={0:'lightcoral',1:'khaki',2:'yellowgreen',3:'orange',4:'blue',5:'pink',6:'yellow',7:'darkgoldenrod',8:'Green'
+          ,9:'aqua',10:'Black',11:'Grey',12:'forestgreen',13:'paleturquoise',14:'navy',15:'darkmagenta',
+         16:'indigo',17:'salmon',18:'firebrick',19:'dodgerblue'}
+
+################################################################ function definitions
+
+def sorter(lister):
+    lister.sort(key=lambda x:x[1],reverse=False)
+    return(lister)
+
+def recoder(df,name,newname,val1,rec1,val2,rec2):
+    newcolumn=[]
+    for i in enumerate(df.index):
+        row=i[1]
+        value=df.loc[row,name]
+        if value==val1:
+            newcolumn.append(rec1)
+        else:
+            newcolumn.append(rec2)
+    df[newname]=newcolumn    
+
+
+######################## Designing the dataframes for downstream analysis
+
+df1=merged_df0.loc[(merged_df0['Severity']!=''),:] ## fill '' to exclude certain groups
+df1=df1.loc[df1['PAID']!='',:] # fill '' to remove outliers if desired
+
+for fs in f:
+    if fs not in df1.columns:
+        f.remove(fs)
+        print(f'{fs} was removed from list')
+
+df1.loc[:,f]=np.log2(df1.loc[:,f])
+df2=df1.loc[:,['ID',treat,'Time point']+confounder_q+confounder_bi+f]
+
+########### robust standardization of protein values
+qns2=np.apply_along_axis(robustbase.Qn,0,np.array(df2.loc[:,f]))
+dictqn2=dict(zip(f,qns2))
+
+df2.loc[:,f]=(df2.loc[:,f]-df2.loc[:,f].median())
+for column in df2.loc[:,f].columns:
+    df2[column]=df2[column]/dictqn2[column]
+
+df2=df2.dropna(axis=1)
+df2=df2.dropna(axis=0)
+
+df3=df2.loc[df2['Time point']==time1,f]
+df4=df2.loc[df2['Time point']==time2,f]
+  
+####### finding differences and puting it in a frame
+ind=np.intersect1d(np.unique(np.array(df2.loc[df2['Time point']==time2,'ID'])),
+                   np.unique(np.array(df2.loc[df2['Time point']==time1,'ID'])))
+dfcs=pd.DataFrame(columns=f,index=ind)
+for i,ind in enumerate(dfcs.index):
+    for j in f:
+        level24=np.array(df2.loc[(df2['ID']==ind) & (df2['Time point']==time2),j])[0]
+
+        level0=np.array(df2.loc[(df2['ID']==ind) & (df2['Time point']==time1),j])[0]
+        dfcs.at[ind,j]=level24-level0
+
+dfcs=dfcs.dropna(axis=1)    
+dfcs=dfcs.dropna(axis=0).reset_index()   
+dfcs=dfcs.drop(columns='index')
+dfcs=dfcs.astype(float)
+
+################################## correlation network
+
+corr3=df3.corr(method='spearman')
+corr4=df4.corr(method='spearman')
+corrcs=dfcs.corr(method='spearman')
+
+corr=((((corr3+corr4)**powered)/2)+(corrcs**powered))/2
+
+
+######################################################################## i graph and Leidan
+print(f'{time1} and {time2} hour leiden and igraph method')
+
+g=igraph.Graph(directed=False)
+weights =[]
+dump=[]
+
+g.add_vertices(len(df3.columns))
+
+for i in range(len(g.vs)):
+    g.vs[i]["id"]= i
+    g.vs[i]["label"]= str(df3.columns[i])
+
+for i, row in corr.iterrows():
+
+    #for j, weight in row.iteritems():
+    df_rowness=pd.DataFrame(row)
+    for j, weight in df_rowness.iterrows():
+        if (j,i) in dump or i==j:          
+            continue
+        else:
+            dump.append((i,j)) 
+            g.add_edges([(list(df3.columns).index(i),list(df3.columns).index(j))])
+            
+            weights.append(weight**powered)
+
+g.es['weight'] = weights
+
+part= leidenalg.find_partition(g, leidenalg.ModularityVertexPartition,weights=weights)
+memberships=[]
+for i in range(len(df3.columns)):
+    memberships.append([df3.columns[i],part.membership[i]])
+
+sorter(memberships)
+   
+############################################## eigenvectors
+
+column_groups=[]
+for j in range(len(part.sizes())):
+    subgraph=part.subgraph(j)
+    egvs=subgraph.evcent(directed=False, weights='weight')
+    signed_evgs=[]
+    column_groups.append({})
+    leader=subgraph.vs[egvs.index(max(egvs))]['label']
+    print('\nLeader\n',leader)    
+    print()
+    for i in range(len(egvs)):
+        time1_corr=sp.stats.spearmanr(df3[leader],df3[subgraph.vs[i]['label']])[0]
+        time2_corr=sp.stats.spearmanr(df4[leader],df4[subgraph.vs[i]['label']])[0]
+        relations=time1_corr+time2_corr
+        if egvs[i] >= 0.025:
+            if relations >0:
+                signed=egvs[i]
+                signed_evgs.append(signed)
+            else:
+                signed=egvs[i]*(-1)
+                signed_evgs.append(signed)
+            column_groups[j][subgraph.vs[i]['label']]=signed
+            print(subgraph.vs[i]['label'],signed)
+        else:
+            print(subgraph.vs[i]['label'],'was removed')
+            f.remove(subgraph.vs[i]['label'])
+            
+
+######################################### dividing positives and negatives
+
+print('\n')
+
+df6=merged_df0.loc[(merged_df0['Severity']!=3),:].reset_index()
+df6.loc[:,f]=(df6.loc[:,f]-df6.loc[:,f].mean())/df6.loc[:,f].std()
+
+column_groups_pos=[]
+column_groups_neg=[]
+primary_len=len(column_groups)
+for i in range(primary_len):
+    column_groups_pos.append({})
+    column_groups_neg.append({})
+    for j in column_groups[i].keys():
+        value=column_groups[i][j]
+        if value>0:
+            column_groups_pos[i][j]=value
+        else:
+            column_groups_neg[i][j]=value
+
+for dicto in column_groups_neg:
+    if dicto!={}:
+        column_groups_pos.append(dicto)
+
+labels=['Module' + str(x) for x in range (0, len(column_groups_pos))]
+
+for labeln in range(len(labels)):
+    label=labels[labeln]
+    df6[label]=0
+    weights_total=0
+
+    for col,weights in column_groups_pos[labeln].items():
+
+        df6[label]=df6[label]+(weights*df6[col])
+        weights_total=weights_total+weights
+    df6[label]=df6[label]/weights_total
+    df6[label]=(df6[label]-df6[label].mean())/df6[label].std()
+
+print()
+
+########################################################## correlation heatmap  
+
+df7=df6.loc[:]
+correlated=df7.loc[:,labels].corr(method='spearman')
+
+plot=sns.clustermap(correlated,center=0.0,linewidth=0,figsize=(6,6),dendrogram_ratio=0.05,cbar_pos=None,
+                    cmap=sns.diverging_palette(265,-366, n=1001))
+
+plt.title(f'Correlation HM',fontsize=20)
+plt.show()
+
+########################################
+############################################################# Charting modules and building causal forrest one by one
+print()
+
+def leader_printer(number):
+    leaders=[]
+    for key,values in column_groups_pos[number].items():
+        sortedleads=sorted(column_groups_pos[number].values(),reverse=True)
+        if values in sortedleads[:min(30,len(sortedleads))]:
+            leaders.append(key)
+    print(leaders)
+
+def plotinfo (name):
+    plt.title(name,fontsize=25)
+    plt.xlabel('\nTime point (hours post-admission)',fontsize=20)
+    plt.ylabel('Standardized Module score',fontsize=22)
+    plt.xticks(fontsize=16)
+    plt.yticks(fontsize=14)
+    ax = fig.gca()
+    handles, labeled = ax.get_legend_handles_labels()
+    label_mapping = {0: "No", 1: "Yes"}
+    labeled = [label_mapping.get(int(float(labela)), labela) for labela in labeled]
+    legend_properties = {'size': '15', 'family': 'Arial'}
+    plt.legend(handles, labeled,title=f'Received {treat}',   
+               #loc='lower right', 
+               frameon=True, 
+               edgecolor='black', 
+               facecolor='0.99', 
+               framealpha=1.0, 
+               fancybox=True, 
+               shadow=True, 
+               title_fontsize='16', 
+               prop=legend_properties)
+    
+    plt.grid(color='0.10',linestyle='--',linewidth=0.3)
+    plot.set_facecolor('0.98')
+    
+for labeln in range(len(labels)):
+    
+    print('\n\n\n')
+    label=labels[labeln]
+    print(label)
+    leader_printer(labeln)        
+
+########################################################### unadjusted plot
+
+    
+    #creating a fake 14 h time point
+    df_with_14=df6.groupby(['Time point',treat])[label].median()
+
+    mean_0=(df_with_14[4][0]+df_with_14[24][0])/2
+    mean_1=(df_with_14[4][1]+df_with_14[24][1])/2
+    new_rows = []
+
+
+    for k,row in df6.iterrows():
+        if df6.at[k,'Time point']==24:
+            new_row = row.copy()
+            new_row['Time point'] = int(14)
+
+            if df6.at[k,treat]==0:
+                new_row[label] = float(mean_0)
+
+            elif df6.at[k,treat]==1:
+                new_row[label] = float(mean_1)
+
+            new_rows.append(new_row)
+
+
+    duplicated_rows = pd.DataFrame(new_rows)
+    df6_with_14 = pd.concat([df6, duplicated_rows], ignore_index=True)
+
+    
+    fig =plt.figure(figsize=(10,6))
+    plot=sns.pointplot(y=df6_with_14.loc[df6_with_14['Sample']=='Donor',label],
+                       x=df6_with_14.loc[df6_with_14['Sample']=='Donor','Time point'],
+                       order=[-1],#linestyles=['dashed','dotted','dashdot','solid'],markers=['D','o','^','v'],
+                       capsize=0.12,errwidth=4.4,estimator=np.median,ci=95,n_boot=10000,dodge=True,color='forestgreen')
+    
+    plot=sns.pointplot(y=df6_with_14.loc[df6_with_14['Sample']!='Donor',label],
+                       x=df6_with_14.loc[df6_with_14['Sample']!='Donor','Time point'],
+                       order=[-1,0,4,14,24],hue=df6_with_14.loc[df6_with_14['Sample']!='Donor',treat],
+                       linestyles=['dashed','dotted','dashdot','solid'],markers=['D','o','^','v'],#size=2000,'s'
+                       capsize=0.12,errwidth=4.4,estimator=np.median,ci=95,n_boot=10000,dodge=True)   
+
+    sns.color_palette('rocket')
+    plotinfo(f'{label}\n')
+    plt.show()
+    print()
+    
+################################# calculations
+
+    for timer in [time1,time3,time2]:
+        print('\n')
+        print(label,timer)
+        target=[label]
+        
+       
+################################################ Making data frames
+
+        df10=df6.loc[(df6['Sample']==sample_set) & (df6['Time point']==timer),:].reset_index()
+        df10.loc[:,confounder_q]=(df10.loc[:,confounder_q]-df10.loc[:,confounder_q].mean())/df10.loc[:,confounder_q].std()
+        df30=df10.loc[:,confounder_bi+confounder_q]
+        df40=df10.loc[:,moderator]
+        df50=df10.loc[:,target]
+
+        W=np.array(df30)
+        X=np.array(df40)
+        Y=np.array(df50)
+        T=np.array(df10[treat])
+
+        ####################################################################### DoubleML
+        print('EconML with heterogeneity')
+
+        est=econdml.CausalForestDML(model_y=RandomForestRegressor(n_estimators=reps,min_samples_split=split),
+                                model_t=RandomForestClassifier(n_estimators=reps,min_samples_split=split),
+                                cv=split,random_state=42,n_estimators=reps,discrete_treatment=True)
+  
+        est.fit(Y, T, X=X, W=W)
+        print(est.ate__inference().summary_frame())   
+        print()   
+      
+        
+fdrps=statsmodels.stats.multitest.multipletests(pvalues,method='fdr_bh') ### values contains all module/timepoint nominal p-values
+print(fdrps)
+
+##################################### focusing on important modules and highlighting important moderations 
+
+importantes_modulo=['Module1','Module3','Module7','Module8','Module10'] ## as identified from above results
+dfmodular=df6[importantes_modulo]
+dfmodular.columns=['FLAME1','FLAME2','CLOT','ALPHA','SURF']#
+print(dfmodular.corr(method='spearman'))
+dfmodular.corr(method='spearman').style.background_gradient(cmap ='coolwarm')
+splot=sns.clustermap(dfmodular.corr(method='spearman'),center=0.0,linewidth=0,figsize=(3.9,3.9),dendrogram_ratio=0.05,cbar_pos=None,
+                    cmap=sns.diverging_palette(265,-366, n=1001))
+
+plt.title(f'Selected module correlations\n',fontsize=13)
+plt.show()
+
+labels=['Module0','Module1','Module2','Module3',
+         'Module4','Module5','Module6','Module7',
+         'Module8','Module9','Module10','Module11','Module12']
+
+for labeln in range(len(labels)):
+    label=labels[labeln]
+    if label in importantes_modul:
+        print('\n\n')
+        
+        print(label)
+        leader_printer(labeln) 
+        for timer in [time1,time3,time2]:
+            print(timer)
+            means={}
+            conf_intervals = {}
+            target=[label]
+            
+            ################################################ Making data frames            
+            df10=df6.loc[(df6['Sample']==sample_set) & (df6['Time point']==timer),:].reset_index()
+            df10.loc[:,confounder_q]=(df10.loc[:,confounder_q]-df10.loc[:,confounder_q].mean())/df10.loc[:,confounder_q].std()
+
+
+            #################################### more frames
+
+            df30=df10.loc[:,confounder_bi+confounder_q]
+            df40=df10.loc[:,moderator]
+            df50=df10.loc[:,target]
+
+            W=np.array(df30)
+            X=np.array(df40)
+            Y=np.array(df50)
+            T=np.array(df10[treat])
+
+            ######################################################## DoubleML
+            
+            est=econdml.CausalForestDML(model_y=RandomForestRegressor(n_estimators=300,min_samples_split=split),
+                                    model_t=RandomForestClassifier(n_estimators=300,min_samples_split=split),
+                                    cv=split,random_state=42,n_estimators=reps,discrete_treatment=True)
+                     est.fit(Y, T, X=X, W=W)
+
+            print()
+         
+            pointestimates=est.effect(X)
+            indi_effs=pointestimates.reshape(1,len(pointestimates))[0]
+            lb, ub = est.effect_interval(X, alpha=0.05)
+            ubs=ub.reshape(1,len(ub))[0]
+            lbs=lb.reshape(1,len(ub))[0]
+
+
+            print(est.ate__inference().summary_frame())
+            print()
+
+
+            for risk in ['LTOWB','Platelet','Cryo','Head_AIS_bi',#,'TBI','Prehospital_GCS',
+                         'Shock_bi','Penetrating','Severity','Age_group','Biological_sex']:
+                X1=df10.loc[df10[risk]==1,moderator]
+                X0=df10.loc[df10[risk]==0,moderator]
+
+
+                summaries1=est.effect_inference(X1).population_summary(alpha=0.05,value=1,decimals=2, tol=0.0001)#
+                risk_means1=summaries1.mean_point[0]
+                risk_vals1=(summaries1.conf_int_mean()[0][0],summaries1.conf_int_mean()[1][0])
+                means[f'{risk} on']=risk_means1
+                conf_intervals[f'{risk} on']=risk_vals1
+
+                summaries0=est.effect_inference(X0).population_summary(alpha=0.05,value=1,decimals=2, tol=0.0001)# 
+                risk_means0=summaries0.mean_point[0]
+                risk_vals0=(summaries0.conf_int_mean()[0][0],summaries0.conf_int_mean()[1][0])
+                means[f'{risk} off']=risk_means0
+                conf_intervals[f'{risk} off']=risk_vals0
+                
+                print(f'{risk}')
+                print('Pval: ',np.round(sp.stats.mannwhitneyu(est.effect(X1),est.effect(X0))[1],3))
+                print('CohenD: ',np.round(cohend(est.effect(X1),est.effect(X0)),3))
+                
+                print()
+            
+            colors = ['Crimson','green'] * (len(means) // 2)
+
+            positions = [0]
+            narrow_spacing = 1
+            wide_spacing = 2
+
+            for i in range(1, len(means)):
+           
+                if i % 2 != 0:
+                    positions.append(positions[-1] + narrow_spacing)
+    
+                else:
+                    positions.append(positions[-1] + wide_spacing)
+
+            sns.set(rc={'figure.figsize':(4,6)})
+            fig, ax = plt.subplots()
+            for i, ((key, mean), color) in enumerate(zip(means.items(), colors)):
+                lower, upper = conf_intervals[key]
+                error = [[mean - lower], [upper - mean]]
+
+                ax.errorbar(mean, positions[i], xerr=error, fmt='o', color=color, ecolor=color,
+                            label=key if i < 2 else "", capsize=5, capthick=2, linestyle='')
+
+            ax.set_facecolor('0.98')
+            plt.yticks(positions, means.keys())
+            plt.xlabel(f'\n Standardized plasma effect on {label}',fontsize=16)
+            plt.ylabel('Potential moderators\n',fontsize=14)
+            plt.title(f'Assessing effect moodification at {timer}h\n',fontsize=17)
+            ax.grid(color='grey',linestyle='--',linewidth=0.3)
+
+            plt.show()
+            print()
+
+        print('\n\n\n')
+                
